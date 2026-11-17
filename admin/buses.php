@@ -1,0 +1,190 @@
+<?php
+require dirname(__DIR__) . '/includes/bootstrap.php';
+require_admin();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check();
+    $id = (int) ($_POST['id'] ?? 0);
+    if (($_POST['action'] ?? '') === 'delete') {
+        $used = (int) qone('SELECT COUNT(*) c FROM schedules WHERE bus_id = ?', 'i', [$id])['c'];
+        if ($used) {
+            flash('err', 'This bus has schedules. Mark it under maintenance instead.');
+        } else {
+            qexec('DELETE FROM buses WHERE id = ?', 'i', [$id]);
+            flash('ok', 'Bus deleted.');
+        }
+        redirect('buses.php');
+    }
+    require_once dirname(__DIR__) . '/includes/timetable.php';
+    require_once dirname(__DIR__) . '/includes/fleet_replace.php';
+    $number = strtoupper(trim($_POST['bus_number'] ?? ''));
+    $name = trim($_POST['name'] ?? '');
+    $type = $_POST['coach_type'] ?? 'Standard';
+    $seats = (int) ($_POST['total_seats'] ?? 0);
+    $dayOff = parse_day_off($_POST['day_off'] ?? next_staggered_day_off('buses'));
+    $statusIn = $_POST['status'] ?? 'active';
+    if ($statusIn === 'maintenance') {
+        $status = 'maintenance';
+    } elseif ($statusIn === 'spare' || $dayOff === 0) {
+        $status = 'active';
+        $dayOff = 0;
+    } else {
+        $status = 'active';
+        if ($dayOff === 0) {
+            $dayOff = next_staggered_day_off('buses');
+        }
+    }
+    if (!in_array($type, ['Standard', 'VIP', 'Executive'], true)) {
+        $type = 'Standard';
+    }
+    if ($number === '' || $name === '' || $seats < 8 || $seats > 60) {
+        flash('err', 'Enter a bus number, name, and between 8 and 60 seats.');
+        redirect('buses.php' . ($id ? '?id=' . $id : ''));
+    }
+    try {
+        if ($id) {
+            $was = qone('SELECT status, day_off FROM buses WHERE id = ?', 'i', [$id]);
+            qexec('UPDATE buses SET bus_number=?, name=?, coach_type=?, total_seats=?, day_off=?, status=? WHERE id=?', 'sssissi', [$number, $name, $type, $seats, $dayOff, $status, $id]);
+            if ($statusIn === 'spare' || $dayOff === 0) {
+                release_vehicle_to_spare('bus', $id);
+            } elseif ($status === 'active' && $dayOff !== 0 && ($was['status'] ?? '') === 'maintenance') {
+                reactivate_fleet_vehicle('bus', $id);
+            }
+            flash('ok', 'Bus updated.');
+        } else {
+            $newId = qexec('INSERT INTO buses (bus_number, name, coach_type, total_seats, day_off, status) VALUES (?, ?, ?, ?, ?, ?)', 'sssiss', [$number, $name, $type, $seats, $dayOff, $status]);
+            if ($statusIn === 'spare' || $dayOff === 0) {
+                release_vehicle_to_spare('bus', $newId);
+            }
+            flash('ok', 'Bus added.');
+        }
+    } catch (mysqli_sql_exception $ex) {
+        flash('err', (int) $ex->getCode() === 1062 ? 'That bus number already exists.' : 'Could not save the bus.');
+    }
+    redirect('buses.php');
+}
+
+require_once dirname(__DIR__) . '/includes/timetable.php';
+$edit = isset($_GET['id']) ? qone('SELECT * FROM buses WHERE id = ?', 'i', [(int) $_GET['id']]) : null;
+$find = trim($_GET['q'] ?? '');
+$fleetView = trim($_GET['fleet'] ?? 'active');
+if (!in_array($fleetView, ['active', 'spare', 'maintenance', 'all'], true)) {
+    $fleetView = 'active';
+}
+$busWhere = [];
+$busTypes = '';
+$busParams = [];
+if ($fleetView === 'active') {
+    $busWhere[] = "status = 'active' AND day_off BETWEEN 1 AND 7";
+} elseif ($fleetView === 'spare') {
+    $busWhere[] = "status = 'active' AND day_off = 0";
+} elseif ($fleetView === 'maintenance') {
+    $busWhere[] = "status = 'maintenance'";
+}
+if ($find !== '') {
+    $busWhere[] = '(bus_number LIKE ? OR name LIKE ? OR coach_type LIKE ?)';
+    $like = '%' . $find . '%';
+    $busTypes .= 'sss';
+    $busParams = [$like, $like, $like];
+}
+$whereSql = $busWhere ? ('WHERE ' . implode(' AND ', $busWhere)) : '';
+$perPage = 40;
+$totalBuses = (int) qone('SELECT COUNT(*) c FROM buses ' . $whereSql, $busTypes, $busParams)['c'];
+$pages = max(1, (int) ceil($totalBuses / $perPage));
+$page = min($pages, max(1, (int) ($_GET['page'] ?? 1)));
+$busQuery = 'fleet=' . urlencode($fleetView) . '&q=' . urlencode($find);
+$rows = qall(
+    'SELECT * FROM buses ' . $whereSql . ' ORDER BY bus_number LIMIT ' . $perPage . ' OFFSET ' . (($page - 1) * $perPage),
+    $busTypes,
+    $busParams
+);
+$countActive = (int) qone("SELECT COUNT(*) c FROM buses WHERE status = 'active' AND day_off BETWEEN 1 AND 7")['c'];
+$countSpare = (int) qone("SELECT COUNT(*) c FROM buses WHERE status = 'active' AND day_off = 0")['c'];
+$countMaint = (int) qone("SELECT COUNT(*) c FROM buses WHERE status = 'maintenance'")['c'];
+$editStatus = $edit ? fleet_list_status($edit) : 'active';
+$pageTitle = 'Buses';
+$active = 'buses';
+require dirname(__DIR__) . '/includes/admin-header.php';
+?>
+<form class="card form-grid" method="post">
+  <?= csrf_field() ?>
+  <input type="hidden" name="id" value="<?= (int) ($edit['id'] ?? 0) ?>">
+  <h2><?= $edit ? 'Edit bus' : 'Add bus' ?></h2>
+  <label>Number<input name="bus_number" required maxlength="20" value="<?= e($edit['bus_number'] ?? '') ?>"></label>
+  <label>Name<input name="name" required maxlength="80" value="<?= e($edit['name'] ?? '') ?>"></label>
+  <label>Coach
+    <select name="coach_type">
+      <?php foreach (['Standard', 'VIP', 'Executive'] as $type): ?>
+        <option <?= ($edit['coach_type'] ?? '') === $type ? 'selected' : '' ?>><?= e($type) ?></option>
+      <?php endforeach; ?>
+    </select>
+  </label>
+  <label>Seats<input type="number" min="8" max="60" name="total_seats" required value="<?= e((string) ($edit['total_seats'] ?? '40')) ?>"></label>
+  <label>Day off
+    <select name="day_off">
+      <?php
+        $selectedDay = (int) ($edit['day_off'] ?? ($editStatus === 'spare' ? 0 : next_staggered_day_off('buses')));
+        foreach (weekday_options(true) as $dayNum => $dayLabel):
+      ?>
+        <option value="<?= (int) $dayNum ?>" <?= $selectedDay === (int) $dayNum ? 'selected' : '' ?>><?= e($dayLabel) ?></option>
+      <?php endforeach; ?>
+    </select>
+  </label>
+  <label>Status
+    <select name="status">
+      <option value="active" <?= $editStatus === 'active' ? 'selected' : '' ?>>Active</option>
+      <option value="spare" <?= $editStatus === 'spare' ? 'selected' : '' ?>>Spare</option>
+      <option value="maintenance" <?= $editStatus === 'maintenance' ? 'selected' : '' ?>>Maintenance</option>
+    </select>
+  </label>
+  <button class="btn" type="submit"><?= $edit ? 'Save bus' : 'Add bus' ?></button>
+</form>
+<form class="filters" method="get">
+  <input type="hidden" name="fleet" value="<?= e($fleetView) ?>">
+  <input type="search" name="q" value="<?= e($find) ?>" placeholder="Number, name, or class">
+  <button class="btn" type="submit">Search</button>
+  <span class="muted"><?= number_format($totalBuses) ?> on this list</span>
+</form>
+<p class="filters">
+  <?php foreach (['active' => 'Active (' . number_format($countActive) . ')', 'spare' => 'Spare (' . number_format($countSpare) . ')', 'maintenance' => 'Maintenance (' . number_format($countMaint) . ')', 'all' => 'All'] as $key => $label): ?>
+    <a class="<?= $fleetView === $key ? 'on' : '' ?>" href="buses.php?fleet=<?= e($key) ?><?= $find !== '' ? '&q=' . urlencode($find) : '' ?>"><?= e($label) ?></a>
+  <?php endforeach; ?>
+</p>
+<div class="table-wrap card">
+  <table>
+    <thead><tr><th>Number</th><th>Name</th><th>Coach</th><th>Seats</th><th>Day off</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+      <?php foreach ($rows as $row): ?>
+        <tr>
+          <td><?= e($row['bus_number']) ?></td>
+          <td><?= e($row['name']) ?></td>
+          <td><?= e($row['coach_type']) ?></td>
+          <td><?= (int) $row['total_seats'] ?></td>
+          <td><span class="day-off"><?= e(weekday_name((int) $row['day_off'])) ?></span></td>
+          <td><?= badge(fleet_list_status($row)) ?></td>
+          <td class="actions">
+            <a href="buses.php?id=<?= (int) $row['id'] ?>&<?= e($busQuery) ?>&page=<?= $page ?>">Edit</a>
+            <form method="post" data-confirm="Delete this bus?">
+              <?= csrf_field() ?>
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="id" value="<?= (int) $row['id'] ?>">
+              <button type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+      <?php endforeach; ?>
+    </tbody>
+  </table>
+</div>
+<?php if ($pages > 1): ?>
+  <p class="filters pager">
+    <?php if ($page > 1): ?>
+      <a href="buses.php?<?= e($busQuery) ?>&page=<?= $page - 1 ?>">Previous</a>
+    <?php endif; ?>
+    <span class="muted">Page <?= $page ?> of <?= number_format($pages) ?></span>
+    <?php if ($page < $pages): ?>
+      <a href="buses.php?<?= e($busQuery) ?>&page=<?= $page + 1 ?>">Next</a>
+    <?php endif; ?>
+  </p>
+<?php endif; ?>
+<?php require dirname(__DIR__) . '/includes/admin-footer.php'; ?>
